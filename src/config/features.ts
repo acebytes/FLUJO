@@ -38,4 +38,9 @@ export const FEATURES = {
    */
   REDACT_ENV_VARS_IN_LOGS: false,
 
+  /**
+   * List of patterns to identify sensitive environment variables that should be redacted
+   * Any environment variable containing these strings will be redacted when REDACT_ENV_VARS_IN_LOGS is true
+   */
+  SENSITIVE_ENV_PATTERNS: ['API_KEY', 'API_TOKEN', 'SECRET', 'PASSWORD', 'CREDENTIAL', 'TOKEN'],
 };

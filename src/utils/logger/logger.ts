@@ -23,20 +23,28 @@ function redactEnvVars(input: any): any {
     return input;
   }
 
-  // For strings, replace all env var values with their names
+  // For strings, replace sensitive env var values with their names
   if (typeof input === 'string') {
     let result = input;
+    
     // Loop through all environment variables
     Object.entries(process.env).forEach(([key, value]) => {
       // Skip empty values or keys
-      if (!value || !key) return;
+      if (!value || !key || value.length <= 3) return; // Skip very short values to avoid common string replacements
       
-      // Create a regular expression that will match the value globally
-      // Using a RegExp constructor to allow for dynamic pattern with proper escaping
-      const valueRegex = new RegExp(String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g');
+      // Check if this environment variable matches any sensitive pattern
+      const isSensitive = FEATURES.SENSITIVE_ENV_PATTERNS.some(pattern => 
+        key.toUpperCase().includes(pattern)
+      );
       
-      // Replace all occurrences of the value with the key name
-      result = result.replace(valueRegex, `'${key}'`);
+      // Only redact sensitive environment variables
+      if (isSensitive) {
+        // Create a regular expression that will match the value globally
+        const valueRegex = new RegExp(String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g');
+        
+        // Replace all occurrences of the value with the key name
+        result = result.replace(valueRegex, `'${key}'`);
+      }
     });
     return result;
   }
