@@ -2,36 +2,90 @@
 import { FEATURES } from '@/config/features';
 
 export const LOG_LEVEL = {
-  VERBOSE: -1, // Most verbose level for extremely detailed logging
+  VERBOSE: -1,
   DEBUG: 0,
   INFO: 1,
   WARN: 2,
   ERROR: 3
 };
 
-// Use the feature flag with a fallback to ERROR level if not set
 export const CURRENT_LOG_LEVEL = 
   typeof FEATURES.LOG_LEVEL === 'number' ? FEATURES.LOG_LEVEL : LOG_LEVEL.ERROR;
 
+/**
+ * Redacts all environment variable values in a string by replacing them with their variable names
+ * @param input - String or object to redact environment variables from
+ * @returns The redacted string or object
+ */
+function redactEnvVars(input: any): any {
+  // If redaction is not enabled, return the input as-is
+  if (!FEATURES.REDACT_ENV_VARS_IN_LOGS) {
+    return input;
+  }
+
+  // For strings, replace all env var values with their names
+  if (typeof input === 'string') {
+    let result = input;
+    // Loop through all environment variables
+    Object.entries(process.env).forEach(([key, value]) => {
+      // Skip empty values or keys
+      if (!value || !key) return;
+      
+      // Create a regular expression that will match the value globally
+      // Using a RegExp constructor to allow for dynamic pattern with proper escaping
+      const valueRegex = new RegExp(String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g');
+      
+      // Replace all occurrences of the value with the key name
+      result = result.replace(valueRegex, `'${key}'`);
+    });
+    return result;
+  }
+  
+  // For objects, create a deep copy and redact all string values
+  if (typeof input === 'object' && input !== null) {
+    if (Array.isArray(input)) {
+      return input.map(item => redactEnvVars(item));
+    } else {
+      const result = { ...input };
+      for (const key in result) {
+        if (Object.prototype.hasOwnProperty.call(result, key)) {
+          result[key] = redactEnvVars(result[key]);
+        }
+      }
+      return result;
+    }
+  }
+  
+  // For other types (numbers, booleans, etc.), return as-is
+  return input;
+}
+
 function logWithLevel(level: number, filepath: string, message: string, data?: any, overrideLogLevel?: number) {
-  // Use the override log level if provided, otherwise use the global setting
   const effectiveLogLevel = typeof overrideLogLevel === 'number' ? overrideLogLevel : CURRENT_LOG_LEVEL;
   
   if (level >= effectiveLogLevel) {
     const timestamp = new Date().toISOString();
     const logPrefix = `[${timestamp}] [${filepath}]`;
     
-    let output = `${logPrefix} ${message}`;
-    if (data !== undefined) {
-      if (typeof data === 'object') {
+    // Redact environment variables if the feature is enabled
+    const redactedMessage = redactEnvVars(message);
+    let redactedData = data;
+    
+    if (FEATURES.REDACT_ENV_VARS_IN_LOGS && data !== undefined) {
+      redactedData = redactEnvVars(data);
+    }
+    
+    let output = `${logPrefix} ${redactedMessage}`;
+    if (redactedData !== undefined) {
+      if (typeof redactedData === 'object') {
         try {
-          const dataStr = JSON.stringify(data, null, 2);
+          const dataStr = JSON.stringify(redactedData, null, 2);
           output += `:\n${dataStr}`;
         } catch (e) {
           output += ': [Object cannot be stringified]';
         }
       } else {
-        output += `: ${data}`;
+        output += `: ${redactedData}`;
       }
     }
 
@@ -56,6 +110,8 @@ function logWithLevel(level: number, filepath: string, message: string, data?: a
     }
   }
 }
+
+
 
 /**
  * Normalizes a file path to ensure consistent logging format

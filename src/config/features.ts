@@ -30,4 +30,12 @@ export const FEATURES = {
    * When set to false, tool calls will be processed but not included in the response
    */
   INCLUDE_TOOL_CALLS_IN_RESPONSE: true,
+
+  /**
+   * Controls whether environment variable values are redacted in logs
+   * When set to true, any environment variable values in log output will be 
+   * replaced with the name of the variable (e.g., 'OR_API_KEY')
+   */
+  REDACT_ENV_VARS_IN_LOGS: false,
+
 };

@@ -162,3 +162,6 @@ check-punycode.js
 deprecated-packages-report.md
 deprecated-packages.txt
 deprecation-report.md
+
+# macOS filesystem metadata files (not present on Windows systems)
+**/.DS_Store
