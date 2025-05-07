@@ -10,11 +10,14 @@ import {
   Select, 
   MenuItem, 
   Alert,
-  LinearProgress
+  LinearProgress,
+  Switch,
+  FormControlLabel
 } from '@mui/material';
+import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
 import { createLogger } from '@/utils/logger';
 import Spinner from '@/frontend/components/shared/Spinner';
-import { useServerEvents } from '@/frontend/hooks/useServerEvents';
 import { useThemeUtils } from '@/frontend/utils/theme';
 
 const log = createLogger('frontend/components/mcp/MCPToolManager/ToolTester');
@@ -54,59 +57,7 @@ const ToolTester: React.FC<ToolTesterProps> = ({
   const [progress, setProgress] = useState<{ current: number, total?: number } | null>(null);
   const [activeProgressToken, setActiveProgressToken] = useState<string | null>(null);
   const [isCancelling, setIsCancelling] = useState(false);
-  
-  // Subscribe to server events to catch errors and progress updates
-  const { lastEvent } = useServerEvents(serverName);
-  
-  // Handle events from the server (errors and progress updates)
-  useEffect(() => {
-    if (!lastEvent) return;
-    
-    // Handle error events
-    if (lastEvent.type === 'error') {
-      log.warn(`Error event received:`, lastEvent);
-      
-      let errorMessage = '';
-      
-      // Format the error message based on the source
-      if (lastEvent.source === 'timeout') {
-        errorMessage = `Timeout Error: ${lastEvent.message || 'Tool execution timed out'}`;
-        // If we're currently loading, stop the loading state
-        if (isLoading) {
-          setIsLoading(false);
-          // Update the result with the timeout error
-          setResult({
-            success: false,
-            output: '',
-            error: errorMessage
-          });
-        }
-      } else if (lastEvent.source === 'stderr') {
-        errorMessage = `Server Error: ${lastEvent.message || 'Unknown error from server'}`;
-      } else {
-        errorMessage = `Error: ${lastEvent.message || 'Unknown error occurred'}`;
-      }
-      
-      // Set the error notification
-      setErrorNotification(errorMessage);
-      
-      // Clear the notification after 5 seconds
-      const timer = setTimeout(() => {
-        setErrorNotification(null);
-      }, 5000);
-      
-      return () => clearTimeout(timer);
-    }
-    
-    // Handle progress events
-    if (lastEvent.method === 'notifications/progress' && lastEvent.progressToken === activeProgressToken) {
-      log.debug(`Progress event received:`, lastEvent);
-      setProgress({
-        current: lastEvent.progress,
-        total: lastEvent.total
-      });
-    }
-  }, [lastEvent, isLoading, activeProgressToken]);
+  const [showRawResult, setShowRawResult] = useState(false); // State for toggling raw/rendered view
 
   const handleToolSelect = (toolName: string) => {
     setSelectedTool(toolName);
@@ -132,25 +83,52 @@ const ToolTester: React.FC<ToolTesterProps> = ({
   const handleParamChange = (key: string, value: string, schema: any) => {
     let parsedValue: any;
 
-    if (schema.type === 'number') {
-      parsedValue = parseFloat(value);
-      if (isNaN(parsedValue)) {
-        // Handle invalid number input, perhaps with a warning message
-        log.warn(`Invalid number input for ${key}: ${value}`);
-        // Keep the previous value or set to a default number
-        return;
-      }
-    } else if (schema.type === 'boolean') {
-      parsedValue = value.toLowerCase() === 'true';
-    } else if (schema.type === 'object' || schema.type === 'array') {
-      try {
-        parsedValue = JSON.parse(value);
-      } catch (error) {
-        log.warn(`Invalid JSON input for ${key}: ${value}`);
-        return;
+    // Handle empty values based on parameter type
+    if (value === '') {
+      if (schema.type === 'number') {
+        // Use 0 for empty number fields
+        parsedValue = 0;
+        log.debug(`Using default value 0 for empty number parameter: ${key}`);
+      } else if (schema.type === 'boolean') {
+        // Use false for empty boolean fields
+        parsedValue = false;
+        log.debug(`Using default value false for empty boolean parameter: ${key}`);
+      } else if (schema.type === 'object') {
+        // Use empty object for empty object fields
+        parsedValue = {};
+        log.debug(`Using empty object for empty object parameter: ${key}`);
+      } else if (schema.type === 'array') {
+        // Use empty array for empty array fields
+        parsedValue = [];
+        log.debug(`Using empty array for empty array parameter: ${key}`);
+      } else {
+        // For string and other types, use empty string
+        parsedValue = '';
+        log.debug(`Using empty string for empty parameter: ${key}`);
       }
     } else {
-      parsedValue = value;
+      // Handle non-empty values
+      if (schema.type === 'number') {
+        parsedValue = parseFloat(value);
+        if (isNaN(parsedValue)) {
+          // Handle invalid number input
+          log.warn(`Invalid number input for ${key}: ${value}`);
+          // Use 0 as default for invalid numbers instead of returning early
+          parsedValue = 0;
+        }
+      } else if (schema.type === 'boolean') {
+        parsedValue = value.toLowerCase() === 'true';
+      } else if (schema.type === 'object' || schema.type === 'array') {
+        try {
+          parsedValue = JSON.parse(value);
+        } catch (error) {
+          log.warn(`Invalid JSON input for ${key}: ${value}`);
+          // Use appropriate default instead of returning early
+          parsedValue = schema.type === 'array' ? [] : {};
+        }
+      } else {
+        parsedValue = value;
+      }
     }
 
     setParams((prev) => ({
@@ -160,7 +138,7 @@ const ToolTester: React.FC<ToolTesterProps> = ({
   };
 
   const handleTest = async () => {
-    log.debug(`Testing tool: ${selectedTool} with params:`, params);
+    log.debug(`Testing tool: ${selectedTool} with params:`, JSON.stringify(params));
     log.debug(`Timeout: ${timeoutValue} seconds`);
     
     // Reset progress and result
@@ -169,11 +147,41 @@ const ToolTester: React.FC<ToolTesterProps> = ({
     setIsLoading(true);
     
     try {
-      const result = await onTestTool(selectedTool, params, timeoutValue);
-      log.debug(`Test result:`, result);
+      // Ensure parameters are correctly typed according to the schema before sending
+      const typedParams: Record<string, any> = {};
+      const selectedToolData = toolsArray.find((t) => t.name === selectedTool);
+      
+      if (selectedToolData?.inputSchema?.properties) {
+        // Process each parameter according to its schema type
+        Object.entries(params).forEach(([key, value]) => {
+          const schema = selectedToolData.inputSchema.properties[key];
+          if (!schema) {
+            typedParams[key] = value;
+            return;
+          }
+          
+          if (schema.type === 'number' || schema.type === 'integer') {
+            // Ensure number parameters are actually numbers, not strings
+            const numValue = typeof value === 'string' ? parseFloat(value) : value;
+            typedParams[key] = isNaN(numValue as number) ? 0 : numValue;
+          } else if (schema.type === 'boolean') {
+            // Ensure boolean parameters are actually booleans
+            typedParams[key] = Boolean(value);
+          } else {
+            typedParams[key] = value;
+          }
+        });
+      } else {
+        // If no schema is available, use params as is
+        Object.assign(typedParams, params);
+      }
+      
+      log.debug(`Sending typed params:`, JSON.stringify(typedParams));
+      const result = await onTestTool(selectedTool, typedParams, timeoutValue);
+      log.debug(`Test result:`, JSON.stringify(result));
       
       // Store the progress token if available
-      if (result.progressToken) {
+      if (result && result.progressToken) {
         setActiveProgressToken(result.progressToken);
       }
       
@@ -323,19 +331,40 @@ const ToolTester: React.FC<ToolTesterProps> = ({
                       <Box component="span" sx={{ color: 'error.main', ml: 0.5 }}>*</Box>
                     )}
                   </Typography>
-                  <TextField
-                    fullWidth
-                    size="small"
-                    value={params[key] !== undefined ? String(params[key]) : ''}
-                    onChange={(e) => handleParamChange(key, e.target.value, schema)}
-                    placeholder={schema.description || ''}
-                    sx={{
-                      bgcolor: (theme) => theme.palette.background.paper,
-                      '& .MuiOutlinedInput-notchedOutline': {
-                        borderColor: (theme) => theme.palette.mode === 'dark' ? '#3a3a3a' : '#e5e7eb'
+                  
+                  {schema.type === 'boolean' ? (
+                    // Switch for boolean parameters
+                    <FormControlLabel
+                      control={
+                        <Switch
+                          checked={params[key] === true}
+                          onChange={(e) => {
+                            setParams((prev) => ({
+                              ...prev,
+                              [key]: e.target.checked,
+                            }));
+                          }}
+                          size="small"
+                        />
                       }
-                    }}
-                  />
+                      label={schema.description || ''}
+                    />
+                  ) : (
+                    // TextField for other parameter types
+                    <TextField
+                      fullWidth
+                      size="small"
+                      value={params[key] !== undefined ? String(params[key]) : ''}
+                      onChange={(e) => handleParamChange(key, e.target.value, schema)}
+                      placeholder={schema.description || ''}
+                      sx={{
+                        bgcolor: (theme) => theme.palette.background.paper,
+                        '& .MuiOutlinedInput-notchedOutline': {
+                          borderColor: (theme) => theme.palette.mode === 'dark' ? '#3a3a3a' : '#e5e7eb'
+                        }
+                      }}
+                    />
+                  )}
                 </Box>
               )
             )}
@@ -456,19 +485,29 @@ const ToolTester: React.FC<ToolTesterProps> = ({
       )}
 
       {result && (
-        <Paper 
-          sx={{ 
-            mt: 2, 
-            p: 2, 
+        <Paper
+          sx={{
+            mt: 2,
+            p: 2,
             bgcolor: (theme) => theme.palette.mode === 'dark' ? '#1a1a1a' : '#f9fafb'
           }}
         >
-          <Typography variant="subtitle1" sx={{ mb: 1, fontWeight: 'medium' }}>Result:</Typography>
-          {result.success ? (
-            <Box 
-              component="pre" 
-              sx={{ 
+          <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mb: 1 }}>
+            <Typography variant="subtitle1" sx={{ fontWeight: 'medium' }}>Result:</Typography>
+            <FormControlLabel
+              control={<Switch checked={showRawResult} onChange={(e) => setShowRawResult(e.target.checked)} size="small" />}
+              label="Show Raw"
+              sx={{ mr: 0 }}
+            />
+          </Box>
+
+          {showRawResult ? (
+            // Show raw output
+            <Box
+              component="pre"
+              sx={{
                 whiteSpace: 'pre-wrap',
+                wordBreak: 'break-all',
                 fontSize: '0.875rem',
                 p: 1,
                 borderRadius: 1,
@@ -476,15 +515,103 @@ const ToolTester: React.FC<ToolTesterProps> = ({
                 borderColor: (theme) => theme.palette.mode === 'dark' ? '#3a3a3a' : '#e5e7eb',
                 bgcolor: (theme) => theme.palette.background.paper,
                 color: (theme) => theme.palette.text.primary,
-                overflow: 'auto'
+                overflow: 'auto',
+                maxHeight: '400px', // Limit height for raw view
               }}
             >
-              {result.output}
+              {result.success ? result.output : `Error: ${result.error}`}
             </Box>
           ) : (
-            <Typography color="error.main">
-              Error: {result.error}
-            </Typography>
+            // Show rendered output or error
+            result.success ? (
+              (() => {
+                try {
+                  const parsedOutput = JSON.parse(result.output);
+                  // Check if it has the expected MCP content structure (nested under 'data')
+                  if (parsedOutput && parsedOutput.data && Array.isArray(parsedOutput.data.content)) {
+                    return (
+                      <Box sx={{ display: 'flex', flexDirection: 'column', gap: 1 }}>
+                        {parsedOutput.data.content.map((item: any, index: number) => {
+                          if (item.type === 'text') {
+                            return <ReactMarkdown key={index} remarkPlugins={[remarkGfm]}>{item.text}</ReactMarkdown>;
+                          } else if (item.type === 'image' && item.data && item.mimeType) {
+                            return (
+                              <img
+                                key={index}
+                                src={`data:${item.mimeType};base64,${item.data}`}
+                                alt={`Tool Result Image ${index + 1}`}
+                                style={{ maxWidth: '100%', height: 'auto', borderRadius: '4px' }}
+                              />
+                            );
+                          } else if (item.type === 'audio' && item.data && item.mimeType) {
+                            return (
+                              <audio
+                                key={index}
+                                controls
+                                src={`data:${item.mimeType};base64,${item.data}`}
+                                style={{ width: '100%' }}
+                              >
+                                Your browser does not support the audio element.
+                              </audio>
+                            );
+                          } else {
+                            // Fallback for unknown content types or structure
+                            return (
+                              <Box
+                                key={index}
+                                component="pre"
+                                sx={{
+                                  whiteSpace: 'pre-wrap',
+                                  wordBreak: 'break-all',
+                                  fontSize: '0.875rem',
+                                  p: 1,
+                                  borderRadius: 1,
+                                  border: 1,
+                                  borderColor: (theme) => theme.palette.mode === 'dark' ? '#3a3a3a' : '#e5e7eb',
+                                  bgcolor: (theme) => theme.palette.background.paper,
+                                  color: (theme) => theme.palette.text.primary,
+                                  overflow: 'auto'
+                                }}
+                              >
+                                {JSON.stringify(item, null, 2)}
+                              </Box>
+                            );
+                          }
+                        })}
+                      </Box>
+                    );
+                  } else {
+                    // If JSON doesn't match expected structure (e.g., missing data or content array), show raw JSON
+                    throw new Error("Output is valid JSON but not in the expected MCP 'data.content' format.");
+                  }
+                } catch (e) {
+                  // If output is not valid JSON or doesn't match structure, display as plain text
+                  return (
+                    <Box
+                      component="pre"
+                      sx={{
+                        whiteSpace: 'pre-wrap',
+                        wordBreak: 'break-all', // Ensure long strings wrap
+                        fontSize: '0.875rem',
+                        p: 1,
+                        borderRadius: 1,
+                        border: 1,
+                        borderColor: (theme) => theme.palette.mode === 'dark' ? '#3a3a3a' : '#e5e7eb',
+                        bgcolor: (theme) => theme.palette.background.paper,
+                        color: (theme) => theme.palette.text.primary,
+                        overflow: 'auto'
+                      }}
+                    >
+                      {result.output}
+                    </Box>
+                  );
+                }
+              })()
+            ) : (
+              <Typography color="error.main">
+                Error: {result.error}
+              </Typography>
+            )
           )}
         </Paper>
       )}

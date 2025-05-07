@@ -15,16 +15,16 @@ const getFilePath = (key: StorageKey) => path.join(STORAGE_DIR, `${key}.json`);
 async function ensureStorageDir() {
   try {
     await fs.access(STORAGE_DIR);
-    log.debug(`Storage directory exists: ${STORAGE_DIR}`);
+    log.verbose(`Storage directory exists: ${STORAGE_DIR}`); // Changed to verbose
   } catch {
-    log.info(`Creating storage directory: ${STORAGE_DIR}`);
+    log.debug(`Creating storage directory: ${STORAGE_DIR}`); // Changed to debug
     await fs.mkdir(STORAGE_DIR, { recursive: true });
   }
   
   // Check if old storage directory exists and log a warning
   try {
     await fs.access(OLD_STORAGE_DIR);
-    log.error(`Old storage directory found: ${OLD_STORAGE_DIR}. This may cause data inconsistency issues.`);
+    log.warn(`Old storage directory found: ${OLD_STORAGE_DIR}. This may cause data inconsistency issues.`); // Changed to warn
   } catch {
     // Old directory doesn't exist, which is good
   }
@@ -35,7 +35,7 @@ async function ensureStorageDir() {
  * This should be called during application startup
  */
 export async function verifyStorage(): Promise<void> {
-  log.info('Verifying storage system initialization');
+  log.debug('Verifying storage system initialization'); // Changed to debug
   
   // Ensure storage directory exists
   await ensureStorageDir();
@@ -53,7 +53,7 @@ export async function verifyStorage(): Promise<void> {
         // File doesn't exist yet, which is normal for new installations
       }
       
-      log.info(`Storage check: ${key} - ${exists ? 'File exists' : 'File does not exist yet'}`);
+      log.debug(`Storage check: ${key} - ${exists ? 'File exists' : 'File does not exist yet'}`); // Changed to debug
       
       // Check if the file exists in the old location but not in the new location
       const oldFilePath = path.join(OLD_STORAGE_DIR, `${key}.json`);
@@ -72,13 +72,25 @@ export async function verifyStorage(): Promise<void> {
     }
   }
   
-  log.info('Storage verification completed');
+  log.debug('Storage verification completed'); // Changed to debug
 }
 
 export async function saveItem<T>(key: StorageKey, value: T): Promise<void> {
-  await ensureStorageDir();
+  // No longer call ensureStorageDir here, handle directory creation below
   const filePath = getFilePath(key);
-  await fs.writeFile(filePath, JSON.stringify(value, null, 2));
+  try {
+    // Ensure the directory for the specific file exists
+    const dirPath = path.dirname(filePath);
+    await fs.mkdir(dirPath, { recursive: true });
+    log.verbose(`Ensured directory exists: ${dirPath}`); // Changed to verbose
+    
+    // Now write the file
+    await fs.writeFile(filePath, JSON.stringify(value, null, 2));
+    log.verbose(`Successfully saved item to: ${filePath}`); // Changed to verbose
+  } catch (error) {
+    log.error(`Error saving item with key "${key}" to ${filePath}:`, error);
+    throw error; // Re-throw the error after logging
+  }
 }
 
 export async function loadItem<T>(key: StorageKey, defaultValue: T): Promise<T> {
@@ -86,17 +98,52 @@ export async function loadItem<T>(key: StorageKey, defaultValue: T): Promise<T> 
     await ensureStorageDir();
     const filePath = getFilePath(key);
     const content = await fs.readFile(filePath, 'utf-8');
-    return JSON.parse(content);
+    
+    try {
+      const parsedContent = JSON.parse(content);
+      log.verbose(`Successfully loaded item from: ${filePath}`);
+      return parsedContent;
+    } catch (error) {
+      // If JSON parsing fails, this is a critical error - don't return default
+      const parseError = error as Error;
+      log.error(`CRITICAL: Failed to parse JSON from ${filePath}:`, parseError);
+      
+      // Create a backup of the corrupted file before throwing
+      const backupPath = `${filePath}.corrupted.${Date.now()}.bak`;
+      try {
+        await fs.writeFile(backupPath, content);
+        log.info(`Created backup of corrupted file at: ${backupPath}`);
+      } catch (backupError) {
+        log.error(`Failed to create backup of corrupted file:`, backupError);
+      }
+      
+      // Throw a more descriptive error
+      throw new Error(`Failed to parse JSON from ${filePath}. A backup has been created at ${backupPath}. Original error: ${parseError.message}`);
+    }
   } catch (error) {
-    return defaultValue;
+    // Only return default if the file doesn't exist (ENOENT)
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+      log.verbose(`Item with key "${key}" not found at ${getFilePath(key)}, returning default.`);
+      return defaultValue;
+    }
+    
+    // For all other errors (file access issues, parsing errors, etc.), log and throw
+    log.error(`CRITICAL: Error loading item with key "${key}" from ${getFilePath(key)}:`, error);
+    throw error; // Re-throw the error instead of returning default
   }
 }
 
 export async function clearItem(key: StorageKey): Promise<void> {
+  const filePath = getFilePath(key);
   try {
-    const filePath = getFilePath(key);
     await fs.unlink(filePath);
+    log.verbose(`Successfully cleared item: ${filePath}`); // Added verbose log
   } catch (error) {
-    // Ignore if file doesn't exist
+    // Ignore if file doesn't exist (ENOENT)
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+        log.warn(`Error clearing item with key "${key}" at ${filePath}:`, error);
+    } else {
+        log.verbose(`Item with key "${key}" not found at ${filePath}, nothing to clear.`); // Verbose for non-existent file
+    }
   }
 }

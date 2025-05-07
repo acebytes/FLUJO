@@ -154,7 +154,8 @@ export const validateGitHubUrl = async (
 export const cloneRepository = async (
   githubUrl: string,
   repoInfo: RepoInfo,
-  savePath: string
+  savePath: string,
+  forceClone: boolean = false
 ): Promise<{
   success: boolean;
   message: MessageState;
@@ -170,9 +171,11 @@ export const cloneRepository = async (
     if (blobMatch) {
       repoUrl = blobMatch[1];
     }
-    
-    const gitCloneUrl = repoUrl.endsWith('.git') ? repoUrl : `${repoUrl}.git`;
-    
+
+    const gitCloneUrl = repoUrl.endsWith('.git')
+      ? repoUrl 
+      : `${repoUrl.replace(/\/$/, '')}.git`;
+
     // Normalize path by replacing backslashes with forward slashes
     const normalizedPath = savePath.replace(/\\/g, '/');
     
@@ -186,7 +189,8 @@ export const cloneRepository = async (
         action: 'clone',
         repoUrl: gitCloneUrl,
         savePath: normalizedPath,
-        branch: undefined // Optional: specify a branch
+        branch: undefined, // Optional: specify a branch
+        forceClone: forceClone // Add the forceClone parameter
       }),
     });
     

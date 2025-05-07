@@ -1,6 +1,7 @@
 import { NextRequest } from 'next/server';
 import { createLogger } from '@/utils/logger';
 import OpenAI from 'openai';
+import { ChatCompletionMetadata } from '@/shared/types'; // Import the new shared type
 
 const log = createLogger('app/v1/chat/completions/requestParser');
 
@@ -15,10 +16,25 @@ export interface ChatCompletionRequest {
   frequency_penalty?: number;
   presence_penalty?: number;
   user?: string;
+  // Custom extension for conversation state management (DEPRECATED - use metadata)
+  conversation_id?: string;
+  // Use the strict metadata type
+  metadata?: ChatCompletionMetadata;
+  // Node ID to start processing from (for message edits)
+  processNodeId?: string;
+}
+
+// Define a new interface for the parsed result including the extracted flags
+export interface ParsedChatCompletionRequest extends Omit<ChatCompletionRequest, 'metadata' | 'conversation_id'> { // Omit metadata and deprecated conversation_id
+  flujo: boolean;
+  conversation_id?: string; // Keep conversation_id here for the result
+  requireApproval: boolean;
+  flujodebug: boolean; // Add flujodebug here
+  processNodeId?: string; // Add processNodeId for message edits
 }
 
 // Parse request parameters from either query string or body
-export async function parseRequestParameters(request: NextRequest): Promise<ChatCompletionRequest> {
+export async function parseRequestParameters(request: NextRequest): Promise<ParsedChatCompletionRequest> { // Update return type
   const startTime = Date.now();
   const requestId = `req-${Date.now()}`;
   log.debug('Parsing request parameters', { requestId, method: request.method, url: request.url });
@@ -58,9 +74,13 @@ export async function parseRequestParameters(request: NextRequest): Promise<Chat
       ],
       stream,
       temperature: isNaN(temperature) ? undefined : temperature,
-      max_tokens: isNaN(max_tokens) ? undefined : max_tokens
+      max_tokens: isNaN(max_tokens) ? undefined : max_tokens,
+      // Add flags for GET requests (always false as metadata isn't supported)
+      flujo: false,
+      requireApproval: false, // Always false for GET
+      flujodebug: false // Always false for GET
     };
-    
+
     const duration = Date.now() - startTime;
     log.info('GET request parameters parsed successfully', {
       requestId,
@@ -77,8 +97,15 @@ export async function parseRequestParameters(request: NextRequest): Promise<Chat
       const contentType = request.headers.get('content-type') || '';
       log.debug('Request content type', { requestId, contentType });
       
-      const data = await request.json();
-      
+      const data: ChatCompletionRequest = await request.json(); // Add type annotation
+
+      // Extract flags from the strictly typed metadata
+      const flujo = data.metadata?.flujo === "true";
+      // Prefer conversationId (camelCase) from metadata, fallback to deprecated body field
+      const conversationId = data.metadata?.conversationId || data.conversation_id;
+      const requireApproval = data.metadata?.requireApproval === "true";
+      const flujodebug = data.metadata?.flujodebug === "true"; // Extract flujodebug
+
       const duration = Date.now() - startTime;
       log.info('POST request body parsed successfully', {
         requestId,
@@ -87,10 +114,25 @@ export async function parseRequestParameters(request: NextRequest): Promise<Chat
         hasMessages: !!data.messages,
         messageCount: data.messages?.length || 0,
         stream: !!data.stream,
-        temperature: data.temperature
+        temperature: data.temperature,
+        flujo,
+        conversationId,
+        requireApproval,
+        flujodebug // Log the new flag
       });
-      
-      return data;
+
+      // Remove metadata and deprecated conversation_id before returning
+      const { metadata, conversation_id: deprecated_conv_id, ...restData } = data;
+
+      // Return the rest of the data object along with the extracted flags and processNodeId
+      return { 
+        ...restData, 
+        flujo, 
+        conversation_id: conversationId, 
+        requireApproval, 
+        flujodebug,
+        processNodeId: data.processNodeId // Pass through processNodeId if provided
+      };
     } catch (error) {
       const duration = Date.now() - startTime;
       log.error('Error parsing request body', {

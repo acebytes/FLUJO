@@ -18,7 +18,9 @@ import {
   DialogContent,
   DialogActions,
   Button,
-  Typography
+  Typography,
+  FormControlLabel, // Added for checkbox
+  Checkbox // Added for checkbox
 } from '@mui/material';
 import SendIcon from '@mui/icons-material/Send';
 import AttachFileIcon from '@mui/icons-material/AttachFile';
@@ -31,9 +33,22 @@ import { Attachment } from './index';
 interface ChatInputProps {
   onSendMessage: (content: string, attachments: Attachment[]) => void;
   disabled?: boolean;
+  // Add callback and state for the approval toggle
+  requireApproval?: boolean;
+  onRequireApprovalChange?: (checked: boolean) => void;
+  // Add callback and state for the debugger toggle
+  executeInDebugger?: boolean;
+  onExecuteInDebuggerChange?: (checked: boolean) => void;
 }
 
-const ChatInput: React.FC<ChatInputProps> = ({ onSendMessage, disabled = false }) => {
+const ChatInput: React.FC<ChatInputProps> = ({
+  onSendMessage,
+  disabled = false,
+  requireApproval = false,
+  onRequireApprovalChange,
+  executeInDebugger = false, // Default to false
+  onExecuteInDebuggerChange
+}) => {
   const { settings } = useStorage();
   const [message, setMessage] = useState('');
   const [attachments, setAttachments] = useState<Attachment[]>([]);
@@ -402,12 +417,45 @@ const ChatInput: React.FC<ChatInputProps> = ({ onSendMessage, disabled = false }
               <SendIcon />
             </IconButton>
           </Tooltip>
-        </Box>
-      </Paper>
-      
+        </Box> {/* End of Input area Box */}
+
+        {/* Tool Approval Checkbox - Hidden but still functional */}
+        {onRequireApprovalChange && ( // Only show if callback is provided
+          <Box sx={{ mt: 1, display: 'none', justifyContent: 'flex-start' }}>
+            <FormControlLabel
+              control={
+                <Checkbox
+                  checked={requireApproval}
+                  onChange={(e) => onRequireApprovalChange(e.target.checked)}
+                  size="small"
+                  disabled={disabled}
+                />
+              }
+              label={<Typography variant="caption">Require Tool Approvals</Typography>}
+              sx={{ mr: 'auto' }} // Push to the left
+            />
+            {/* Debugger Checkbox */}
+            {onExecuteInDebuggerChange && ( // Only show if callback is provided
+              <FormControlLabel
+                control={
+                  <Checkbox
+                    checked={executeInDebugger}
+                    onChange={(e) => onExecuteInDebuggerChange(e.target.checked)}
+                    size="small"
+                    disabled={disabled}
+                  />
+                }
+                label={<Typography variant="caption">Execute in Debugger</Typography>}
+                sx={{ ml: 2 }} // Add some margin to separate from the other checkbox
+              />
+            )}
+          </Box>
+        )} {/* End of Checkboxes Box */}
+      </Paper> {/* End of main Paper component */}
+
       {/* Dialog for attachment preview/editing */}
-      <Dialog 
-        open={dialogOpen} 
+      <Dialog
+        open={dialogOpen}
         onClose={() => !isProcessing && setDialogOpen(false)}
         maxWidth="md"
         fullWidth

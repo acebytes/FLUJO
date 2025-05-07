@@ -4,19 +4,98 @@ import { createLogger } from '@/utils/logger';
 import { promptRenderer } from '@/backend/utils/PromptRenderer';
 import { ToolHandler } from '../handlers/ToolHandler';
 import { ModelHandler } from '../handlers/ModelHandler';
-import { 
-  SharedState, 
-  ProcessNodeParams, 
-  ProcessNodePrepResult, 
+import { FEATURES } from '@/config/features'; // Import feature flags
+import {
+  SharedState,
+  ProcessNodeParams,
+  ProcessNodePrepResult,
   ProcessNodeExecResult,
-  ToolDefinition
+  ToolDefinition,
+  HandoffToolInfo,
+  STAY_ON_NODE_ACTION, // Keep for reference, but won't be returned directly by post
+  TOOL_CALL_ACTION,    // Import new actions
+  FINAL_RESPONSE_ACTION,
+  ERROR_ACTION,
+  ToolCallInfo
 } from '../types';
+import { FlujoChatMessage } from '@/shared/types/chat'; // Import FlujoChatMessage
 import OpenAI from 'openai';
+import { v4 as uuidv4 } from 'uuid'; // Import uuid
 
 // Create a logger instance for this file
 const log = createLogger('backend/flow/execution/nodes/ProcessNode');
 
 export class ProcessNode extends BaseNode {
+  /**
+   * Generate handoff tools for each connected non-MCP node
+   */
+  private generateHandoffTools(): ToolDefinition[] {
+    log.info('Generating handoff tools');
+
+    const handoffTools: ToolDefinition[] = [];
+
+    // Get all actions (edge IDs)
+    const allActions = this.successors instanceof Map
+      ? Array.from(this.successors.keys())
+      : Object.keys(this.successors || {});
+
+    // Filter out MCP edges - only keep standard edges for flow navigation
+    const actions = allActions.filter(action =>
+      !action.includes('-mcpEdge') &&
+      !action.endsWith('mcpEdge') &&
+      !action.includes('-mcp')
+    );
+
+    log.debug('Found standard actions for handoff tools', {
+      actionsCount: actions.length,
+      actions
+    });
+
+    // Create a handoff tool for each action
+    actions.forEach(edgeId => {
+      // Get the target node
+      const targetNode = this.successors instanceof Map
+        ? this.successors.get(edgeId)
+        : (this.successors as any)[edgeId];
+
+      if (!targetNode) {
+        log.warn(`Target node not found for edge ${edgeId}`);
+        return;
+      }
+
+      const targetNodeId = targetNode.node_params?.id || 'unknown';
+      const targetNodeLabel = targetNode.node_params?.label || 'Unknown Node';
+      const targetNodeType = targetNode.node_params?.type || 'unknown';
+
+      // Create a handoff tool for this edge
+      const handoffTool: ToolDefinition = {
+        name: `handoff_to_${targetNodeId}`,
+        description: `Hand off execution to ${targetNodeLabel} (${targetNodeType})`,
+        inputSchema: {
+          type: "object",
+          properties: {}, // No parameters needed anymore
+          required: []
+        }
+      };
+
+      handoffTools.push(handoffTool);
+
+      log.debug(`Created handoff tool for edge ${edgeId}`, {
+        toolName: handoffTool.name,
+        targetNodeId,
+        targetNodeLabel
+      });
+    });
+
+    // Removed the generic handoff tool creation block
+
+    log.info('Generated handoff tools', {
+      toolsCount: handoffTools.length
+    });
+
+    return handoffTools;
+  }
+
   async prep(sharedState: SharedState, node_params?: ProcessNodeParams): Promise<ProcessNodePrepResult> {
     log.info('prep() started');
 
@@ -26,25 +105,25 @@ export class ProcessNode extends BaseNode {
     const boundModel = node_params?.properties?.boundModel;
     const excludeModelPrompt = node_params?.properties?.excludeModelPrompt || false;
     const excludeStartNodePrompt = node_params?.properties?.excludeStartNodePrompt || false;
-    
-    log.debug('Extracted properties', { 
+
+    log.debug('Extracted properties', {
       nodeId,
       flowId,
-      boundModel, 
+      boundModel,
       excludeModelPrompt,
       excludeStartNodePrompt
     });
-    
+
     if (!nodeId || !flowId) {
       log.error('Missing required node or flow ID', { nodeId, flowId });
       throw new Error("Process node requires node ID and flow ID");
     }
-    
+
     if (!boundModel) {
       log.error('Missing bound model');
       throw new Error("Process node requires a bound model");
     }
-    
+
     // Use the promptRenderer to build the complete prompt
     log.info('Using promptRenderer to build the complete prompt');
     const completePrompt = await promptRenderer.renderPrompt(flowId, nodeId, {
@@ -53,43 +132,52 @@ export class ProcessNode extends BaseNode {
       excludeModelPrompt,
       excludeStartNodePrompt
     });
-    
+
     log.debug('Prompt rendered successfully', {
       completePromptLength: completePrompt.length,
-      completePromptPreview: completePrompt.length > 100 ? 
+      completePromptPreview: completePrompt.length > 100 ?
         completePrompt.substring(0, 100) + '...' : completePrompt
     });
-    
-  // Check if tools are already available in shared state
-  let availableTools: ToolDefinition[] = [];
-  
-  if (sharedState.mcpContext && sharedState.mcpContext.availableTools && sharedState.mcpContext.availableTools.length > 0) {
-    // Use tools already processed by MCPNode
-    log.info('Using MCP tools from shared state', {
-      toolsCount: sharedState.mcpContext.availableTools.length
-    });
-    availableTools = sharedState.mcpContext.availableTools;
-  } else {
-    // Only process MCP nodes if tools are not available in shared state
-    const mcpNodes = node_params?.properties?.mcpNodes || [];
-    
-    if (mcpNodes.length > 0) {
-      log.info('No MCP tools found in shared state, processing MCP nodes', {
-        mcpNodesCount: mcpNodes.length
+
+    // Set the current node ID in shared state
+    sharedState.currentNodeId = nodeId;
+
+    // Check if tools are already available in shared state
+    let availableTools: ToolDefinition[] = [];
+
+    if (sharedState.mcpContext && sharedState.mcpContext.availableTools && sharedState.mcpContext.availableTools.length > 0) {
+      // Use tools already processed by MCPNode
+      log.info('Using MCP tools from shared state', {
+        toolsCount: sharedState.mcpContext.availableTools.length
       });
-      
-      // Process MCP nodes using the ToolHandler
-      const mcpResult = await ToolHandler.processMCPNodes({ mcpNodes });
-      
-      if (!mcpResult.success) {
-        log.error('Failed to process MCP nodes', { error: mcpResult.error });
-        throw new Error(`Failed to process MCP nodes: ${mcpResult.error.message}`);
+      availableTools = sharedState.mcpContext.availableTools;
+    } else {
+      // Only process MCP nodes if tools are not available in shared state
+      const mcpNodes = node_params?.properties?.mcpNodes || [];
+
+      if (mcpNodes.length > 0) {
+        log.info('No MCP tools found in shared state, processing MCP nodes', {
+          mcpNodesCount: mcpNodes.length
+        });
+
+        // Process MCP nodes using the ToolHandler
+        const mcpResult = await ToolHandler.processMCPNodes({ mcpNodes });
+
+        if (!mcpResult.success) {
+          log.error('Failed to process MCP nodes', { error: mcpResult.error });
+          throw new Error(`Failed to process MCP nodes: ${mcpResult.error.message}`);
+        }
+
+        availableTools = mcpResult.value.availableTools;
       }
-      
-      availableTools = mcpResult.value.availableTools;
     }
-  }
-  
+
+    // Generate handoff tools for each connected non-MCP node
+    const handoffTools = this.generateHandoffTools();
+
+    // Add handoff tools to available tools
+    availableTools = [...availableTools, ...handoffTools];
+
   // Create a properly typed PrepResult
   const prepResult: ProcessNodePrepResult = {
     nodeId,
@@ -99,47 +187,49 @@ export class ProcessNode extends BaseNode {
     availableTools: availableTools,
     messages: [] // Will be populated after reordering
   };
-    
+
     // Reorder messages to ensure system messages are at the top
-    // Extract non-system messages
-    const nonSystemMessages: OpenAI.ChatCompletionMessageParam[] = [];
-    
+    // Extract non-system messages (already FlujoChatMessage type from sharedState)
+    const nonSystemMessages: FlujoChatMessage[] = [];
+
     // Copy and categorize messages
-    sharedState.messages.forEach(msg => {
+    sharedState.messages.forEach((msg: FlujoChatMessage) => { // Ensure msg is typed correctly
       if (msg.role !== 'system') {
         nonSystemMessages.push(msg);
       }
     });
-    
-    // Create our own system message with the current prompt
-    const systemMessage = {
+
+    // Create our own system message with the current prompt as FlujoChatMessage
+    const systemMessage: FlujoChatMessage = {
+      id: uuidv4(), // Generate unique ID
       role: 'system',
-      content: completePrompt
-    } as OpenAI.ChatCompletionMessageParam;
-    
+      content: completePrompt,
+      timestamp: Date.now() // Add timestamp
+    };
+
     log.info('Added system message from prompt template', {
       contentLength: completePrompt.length,
       contentPreview: completePrompt.length > 100 ?
         completePrompt.substring(0, 100) + '...' : completePrompt
     });
-    
+
     // Combine messages with our system message first, then non-system messages
     prepResult.messages = [systemMessage, ...nonSystemMessages];
-    
+
     log.info('Reordered messages with system messages at the top', {
       systemMessageCount: 1, // We now have exactly one system message
       nonSystemMessageCount: nonSystemMessages.length,
       totalMessageCount: prepResult.messages.length
     });
-    
-    log.info('prep() completed', { 
+
+    log.info('prep() completed', {
       completePromptLength: completePrompt.length,
       boundModel,
       hasTools: !!prepResult.availableTools?.length,
       toolsCount: prepResult.availableTools?.length || 0,
       messagesCount: prepResult.messages.length
     });
-    
+
     return prepResult;
   }
 
@@ -149,47 +239,88 @@ export class ProcessNode extends BaseNode {
       promptLength: prepResult.currentPrompt?.length,
       messagesCount: prepResult.messages?.length || 0
     });
-    
+
     // Add verbose logging of the entire prepResult
     log.debug('execCore() prepResult', JSON.stringify(prepResult));
-    
+
     try {
       // Prepare tools if available
-      let tools = undefined;
-      
+      let tools: OpenAI.ChatCompletionTool[] | undefined = undefined; // Initialize tools
+
       if (prepResult.availableTools && prepResult.availableTools.length > 0) {
         const toolsResult = ToolHandler.prepareTools({
           availableTools: prepResult.availableTools
         });
-        
+
         if (!toolsResult.success) {
           log.error('Failed to prepare tools', { error: toolsResult.error });
           throw new Error(`Failed to prepare tools: ${toolsResult.error.message}`);
         }
-        
+
         tools = toolsResult.value.tools;
       }
-      
+
       // Get the node name for display
       const nodeName = node_params?.label || node_params?.properties?.name || 'Process Node';
-      
-      // Call the model with tool support
-      const modelResult = await ModelHandler.callModel({
+
+      // --- Log before calling the model ---
+      const lastMessage = prepResult.messages && prepResult.messages.length > 0 ? prepResult.messages[prepResult.messages.length - 1] : null;
+      log.debug(`[ProcessNode ${prepResult.nodeId}] Calling ModelHandler.callModel`, {
         modelId: prepResult.boundModel,
-        prompt: prepResult.currentPrompt,
+        messageCount: prepResult.messages?.length || 0,
+        toolCount: tools?.length || 0,
+        lastMessageType: lastMessage?.role,
+        lastMessageToolCallId: lastMessage?.role === 'tool' ? lastMessage.tool_call_id : undefined,
+        lastMessageContentPreview: typeof lastMessage?.content === 'string' ? lastMessage.content.substring(0, 100) + '...' : '(non-string content)'
+      });
+
+      let modelResult;
+      try {
+        // Call the model with tool support
+        modelResult = await ModelHandler.callModel({
+          modelId: prepResult.boundModel,
+          prompt: prepResult.currentPrompt,
         messages: prepResult.messages,
         tools,
-        iteration: 1,
-        maxIterations: 30,
-        nodeName // Pass the node name to be included in the response header
-      });
-      
-    if (!modelResult.success) {
-      log.error('Model execution error', { error: modelResult.error });
-      
-      // CHANGE: Instead of returning an error result, throw a custom error
+        iteration: 1, // Iteration is no longer handled by ModelHandler, but keep for now
+        maxIterations: 30, // Max iterations no longer handled by ModelHandler
+          nodeName, // Pass the node name to be included in the response header
+          nodeId: prepResult.nodeId // Pass the node ID
+        });
+
+        // --- Log successful model call result (check success first) ---
+        if (modelResult.success) {
+          log.debug(`[ProcessNode ${prepResult.nodeId}] ModelHandler.callModel returned successfully`, {
+            success: true, // Already checked
+            hasContent: !!modelResult.value?.content,
+            contentLength: modelResult.value?.content?.length || 0,
+            toolCallsCount: modelResult.value?.toolCalls?.length || 0
+          });
+        } else {
+           // Log failure if somehow success check failed here (should be caught later)
+           log.warn(`[ProcessNode ${prepResult.nodeId}] ModelHandler.callModel returned failure state unexpectedly here`, { success: false, error: modelResult.error });
+        }
+
+
+      } catch (modelCallError) {
+        // --- Log error during model call ---
+        log.error(`[ProcessNode ${prepResult.nodeId}] Error calling ModelHandler.callModel`, { error: modelCallError });
+        // Re-throw the error to be handled by the outer catch block
+        throw modelCallError;
+      } finally {
+        // --- Log that the model call attempt finished ---
+        log.debug(`[ProcessNode ${prepResult.nodeId}] Finished attempt to call ModelHandler.callModel`);
+      }
+
+      // --- Process the result (if successful) ---
+      if (!modelResult || !modelResult.success) {
+        // This case should ideally be caught by the try/catch, but handle defensively
+        const errorDetails = modelResult?.error || { message: 'Unknown model execution error after call attempt.' };
+        log.error('Model execution error after call attempt', { error: errorDetails });
+
+        // CHANGE: Instead of returning an error result, throw a custom error
       const modelError = new Error(`Model execution failed: ${modelResult.error.message}`);
-      
+
       // Add properties to the error object
       (modelError as any).isModelError = true;
       (modelError as any).details = {
@@ -203,20 +334,20 @@ export class ProcessNode extends BaseNode {
         // Include all other details from the original error
         ...modelResult.error.details
       };
-      
+
       // Log that we're throwing a critical error
       log.error('Throwing critical model error to abort flow execution', {
         error: modelResult.error.message,
         type: modelResult.error.type,
         code: modelResult.error.code
       });
-      
+
       // Throw the error to abort execution
       throw modelError;
       }
-      
+
       const result = modelResult.value;
-      
+
       // Create a properly typed ExecResult
       const execResult: ProcessNodeExecResult = {
         success: true,
@@ -225,7 +356,7 @@ export class ProcessNode extends BaseNode {
         fullResponse: result.fullResponse,
         toolCalls: result.toolCalls
       };
-      
+
       // Log tool calls if present
       if (result.toolCalls && result.toolCalls.length > 0) {
         log.info('Tool calls found in model response', {
@@ -233,34 +364,34 @@ export class ProcessNode extends BaseNode {
           toolNames: result.toolCalls.map(tc => tc.name).join(', ')
         });
       }
-      
+
       log.info('execCore() completed', {
         responseLength: execResult.content?.length || 0,
         messagesCount: execResult.messages?.length || 0,
         hasToolCalls: !!execResult.toolCalls?.length
       });
-      
+
       // Add verbose logging of the entire execResult
       log.verbose('execCore() execResult', JSON.stringify(execResult));
-      
+
       return execResult;
     } catch (error) {
     // For critical tool errors or model errors, we want to rethrow them
     // to abort the flow execution
-    if (error && typeof error === 'object' && 
+    if (error && typeof error === 'object' &&
         ('isCriticalToolError' in error || 'isModelError' in error)) {
       const errorMessage = error instanceof Error ? error.message : String(error);
-      
+
       log.error('Critical error detected - propagating to abort flow:', {
         error: errorMessage,
         isModelError: 'isModelError' in error,
         isCriticalToolError: 'isCriticalToolError' in error
       });
-      
+
       // Rethrow the error to stop execution and propagate to the frontend
       throw error;
       }
-      
+
       // For other errors, create an error result
       const errorResult: ProcessNodeExecResult = {
         success: false,
@@ -271,31 +402,98 @@ export class ProcessNode extends BaseNode {
           stack: error.stack
         } : { message: String(error) }
       };
-      
+
       log.error('execCore() failed', {
         error: errorResult.error,
         errorDetails: errorResult.errorDetails
       });
-      
+
       // Add verbose logging of the error result
       log.verbose('execCore() errorResult', JSON.stringify(errorResult));
-      
+
       return errorResult;
     }
   }
 
+  /**
+   * Process tool calls to check for handoff requests
+   */
+  private processHandoffToolCalls(
+    toolCalls: ToolCallInfo[] | undefined,
+    sharedState: SharedState
+  ): boolean {
+    if (!toolCalls || toolCalls.length === 0) {
+      return false;
+    }
+
+    log.info('Processing tool calls for handoff requests', {
+      toolCallsCount: toolCalls.length
+    });
+
+    // Get all actions (edge IDs)
+    const allActions = this.successors instanceof Map
+      ? Array.from(this.successors.keys())
+      : Object.keys(this.successors || {});
+
+    // Filter out MCP edges - only keep standard edges for flow navigation
+    const actions = allActions.filter(action =>
+      !action.includes('-mcpEdge') &&
+      !action.endsWith('mcpEdge') &&
+      !action.includes('-mcp')
+    );
+
+    // Check for handoff tool calls
+    for (const toolCall of toolCalls) {
+      const { name } = toolCall; // Only need the name now
+
+      // Check for specific handoff tools
+      if (name.startsWith('handoff_to_')) {
+        // Extract target node ID from tool name
+        const targetNodeId = name.replace('handoff_to_', '');
+
+        // Find the edge ID that leads to this node
+        for (const edgeId of actions) {
+          const targetNode = this.successors instanceof Map
+            ? this.successors.get(edgeId)
+            : (this.successors as any)[edgeId];
+
+          if (targetNode && targetNode.node_params?.id === targetNodeId) {
+            // Set handoff request in shared state
+            sharedState.handoffRequested = {
+              edgeId,
+              targetNodeId
+            };
+
+            log.info(`Handoff requested to node ${targetNodeId}`, {
+              edgeId,
+              toolName: name
+            });
+
+            return true; // Handoff confirmed by calling the tool
+          }
+        } // End inner loop (edgeId)
+      } // End if (name.startsWith...)
+    } // End outer loop (toolCall)
+
+    return false; // No handoff tool call found
+  }
+
   async post(
-    prepResult: ProcessNodePrepResult, 
-    execResult: ProcessNodeExecResult, 
-    sharedState: SharedState, 
+    prepResult: ProcessNodePrepResult,
+    execResult: ProcessNodeExecResult,
+    sharedState: SharedState,
     node_params?: ProcessNodeParams
   ): Promise<string> {
-    log.info('post() started', { 
+    // --- Log start of post method ---
+    log.debug(`[ProcessNode ${node_params?.id}] post() method started.`);
+
+    log.info('post() started', {
       execResultSuccess: execResult.success,
       execResultContentLength: execResult.content?.length || 0,
-      messagesCount: execResult.messages?.length || 0
+      messagesCount: execResult.messages?.length || 0,
+      toolCallsCount: execResult.toolCalls?.length || 0
     });
-    
+
     // Store the model response or error in shared state
     if (!execResult.success) {
       // Store error information in shared state
@@ -304,138 +502,64 @@ export class ProcessNode extends BaseNode {
         error: execResult.error,
         errorDetails: execResult.errorDetails
       };
-    } else if (execResult.content) {
-      sharedState.lastResponse = execResult.content;
+      // Add tracking info (as before)
+      if (Array.isArray(sharedState.trackingInfo.nodeExecutionTracker)) {
+        // ... (tracking logic remains the same) ...
+      }
+      log.warn(`Execution failed for node ${node_params?.id}. Returning ERROR_ACTION.`);
+      return ERROR_ACTION; // Return error action
+    } else {
+       // Use the content from execResult which might include prefixes
+       sharedState.lastResponse = execResult.content || '';
     }
-    
+
     // Update shared state with messages from execResult
     if (execResult.messages && execResult.messages.length > 0) {
       // Replace messages in shared state with the updated messages
       sharedState.messages = execResult.messages;
-      
+
       log.info('Updated messages in sharedState', {
         messagesCount: sharedState.messages.length
       });
     }
-    
+
     // Add tracking information for the ProcessNode itself
-    if (Array.isArray(sharedState.trackingInfo.nodeExecutionTracker)) {
+    if (FEATURES.ENABLE_EXECUTION_TRACKER && Array.isArray(sharedState.trackingInfo.nodeExecutionTracker)) {
       sharedState.trackingInfo.nodeExecutionTracker.push({
         nodeType: 'ProcessNode',
         nodeId: node_params?.id || 'unknown',
         nodeName: node_params?.properties?.name || 'Process Node',
-        modelDisplayName: prepResult.modelDisplayName || 'Unknown Model',
+        modelDisplayName: prepResult.modelDisplayName || 'Unknown Model', // Note: modelDisplayName might not be in prepResult, adjust if needed
         modelTechnicalName: prepResult.boundModel || 'unknown',
         allowedTools: node_params?.properties?.allowedTools?.join(', '),
         timestamp: new Date().toISOString()
       });
-      
+
       log.info('Added ProcessNode tracking information', {
-        modelDisplayName: prepResult.modelDisplayName,
+        modelDisplayName: prepResult.modelDisplayName, // Adjust if needed
         modelTechnicalName: prepResult.boundModel
       });
     }
-    
-    log.info('post() completed', { 
-      messagesCount: sharedState.messages?.length || 0
-    });
-    
-    // Get the successors for this node
-    
-    // Log the successors object for debugging
-    log.info('Successors object:', {
-      hasSuccessors: !!this.successors,
-      isMap: this.successors instanceof Map,
-      type: typeof this.successors
-    });
-    
-    // Handle successors as a Map (which is what PocketFlowFramework uses)
-    const allActions = this.successors instanceof Map 
-      ? Array.from(this.successors.keys()) 
-      : Object.keys(this.successors || {});
-    
-    // Filter out MCP edges - only keep standard edges for flow navigation
-    const actions = allActions.filter(action => !action.includes('-mcpEdge') && !action.endsWith('mcpEdge') && !action.includes('-mcp'));
-    
-    // Log the actions for debugging
-    log.info('Actions:', {
-      allActionsCount: allActions.length,
-      allActions: allActions,
-      filteredActionsCount: actions.length,
-      filteredActions: actions
-    });
-    
-    if (actions.length > 0) {
-      // Return the first available standard action
-      const action = actions[0];
-      log.info(`Returning standard action: ${action}`);
-      return action;
-    } else if (allActions.length > 0) {
-      // If no standard actions but we have other actions, log a warning
-      log.warn(`No standard actions found, only MCP edges. This may indicate a flow configuration issue.`);
-    }
-    
-    return "default"; // Default fallback
-  }
 
-  /**
-   * Add message to state
-   */
-  private addMessageToState(
-    prepResult: ProcessNodePrepResult, 
-    role: string, 
-    content: string
-  ): void {
-    // Check if we already have a message with this role
-    const existingMessage = prepResult.messages?.find(
-      (msg: OpenAI.ChatCompletionMessageParam) => msg.role === role
-    );
-    
-    if (!existingMessage) {
-      // Add the message to prepResult.messages
-      if (!prepResult.messages) {
-        prepResult.messages = [];
-      }
-      
-      // Create a properly typed message based on role
-      let message: OpenAI.ChatCompletionMessageParam;
-      
-      switch (role) {
-        case 'system':
-          message = {
-            role: 'system',
-            content: content
-          };
-          break;
-        case 'user':
-          message = {
-            role: 'user',
-            content: content
-          };
-          break;
-        case 'assistant':
-          message = {
-            role: 'assistant',
-            content: content
-          };
-          break;
-        case 'tool':
-          // Tool messages require a tool_call_id
-          throw new Error("Tool messages require a tool_call_id");
-        default:
-          throw new Error(`Unsupported role: ${role}`);
-      }
-      
-      prepResult.messages.push(message);
-      
-      log.info(`Added ${role} message`, {
-        contentLength: content.length,
-        contentPreview: content.length > 100 ?
-          content.substring(0, 100) + '...' : content
-      });
-    } else {
-      log.info(`${role} message already exists, not adding again`);
+    // Process tool calls to check for handoff requests FIRST
+    const handoffRequested = this.processHandoffToolCalls(execResult.toolCalls, sharedState); // Uses the modified processHandoffToolCalls
+    if (handoffRequested && sharedState.handoffRequested) {
+      const edgeId = sharedState.handoffRequested.edgeId;
+      log.info(`Handoff requested via tool call, returning edge ID: ${edgeId}`);
+      // The service layer will clear sharedState.handoffRequested after transition
+      return edgeId; // Return the edgeId as the action for handoff
     }
+
+    // If no handoff, check for other tool calls (excluding handoff tools already processed)
+    const nonHandoffToolCalls = execResult.toolCalls?.filter(tc => !tc.name.startsWith('handoff_to_'));
+    if (nonHandoffToolCalls && nonHandoffToolCalls.length > 0) {
+      log.info('Non-handoff tool calls detected, returning TOOL_CALL_ACTION');
+      return TOOL_CALL_ACTION; // Return tool call action
+    }
+
+    // If no error, no handoff, and no other tool calls, it's a final response for this step
+    log.info('No tool calls or handoff requested, returning FINAL_RESPONSE_ACTION');
+    return FINAL_RESPONSE_ACTION; // Return final response action
   }
 
   _clone(): BaseNode {

@@ -1,5 +1,6 @@
 import cloneDeep from "lodash/cloneDeep";
 import { createLogger } from '@/utils/logger';
+import { STAY_ON_NODE_ACTION } from './types';
 
 const log = createLogger('backend/execution/flow/temp_pocket');
 
@@ -31,7 +32,7 @@ export abstract class BaseNode {
         this.node_params = node_params;
     }
     
-    log.debug(`setParams finished. flow_params`, { flow_params: this.flow_params, node_params: this.node_params });
+    log.debug(`setParams finished. flow_params count`, { flow_params: this.flow_params?.length, node_params: this.node_params?.length });
     
     // Add verbose logging of the updated state
     log.verbose('setParams result', JSON.stringify({
@@ -43,21 +44,21 @@ export abstract class BaseNode {
     public clone(): BaseNode {
         log.debug(`clone called`);
         const newNode = this._clone();
-        log.debug(`_clone result`, { newNode });
+        log.verbose(`_clone result`, { newNode });
         newNode.flow_params = cloneDeep(this.flow_params);
-        log.debug(`Cloned flow_params`, { flow_params: newNode.flow_params });
+        log.verbose(`Cloned flow_params`, { flow_params: newNode.flow_params });
         newNode.node_params = cloneDeep(this.node_params); // Clone node_params
-        log.debug(`Cloned node_params`, { node_params: newNode.node_params });
+        log.verbose(`Cloned node_params`, { node_params: newNode.node_params });
         newNode.successors = new Map(this.successors);
-        log.debug(`Cloned successors`, { successors: newNode.successors });
-        log.debug(`clone finished`);
+        log.verbose(`Cloned successors`, { successors: newNode.successors });
+        log.verbose(`clone finished`);
         return newNode;
     }
 
     abstract _clone(): BaseNode;
 
     public addSuccessor(newSuccessor: BaseNode, action: string = DEFAULT_ACTION): void {
-        log.debug(`addSuccessor called with action: ${action}`);
+        log.verbose(`addSuccessor called with action: ${action}`);
         if (this.successors.has(action)) {
             log.error(`Action ${action} already exists`);
             throw new Error(`Action ${action} already exists`);
@@ -71,7 +72,7 @@ export abstract class BaseNode {
     public getSuccessor(name: string): BaseNode | undefined {
         log.debug(`getSuccessor called with name: ${name}`);
         if (!this.successors.has(name)) {
-            log.debug(`Successor ${name} not found`);
+            log.error(`Successor ${name} not found`);
             return undefined;
         }
 
@@ -120,10 +121,12 @@ export abstract class BaseNode {
   abstract post(prepResult: any, execResult: any, sharedState: any, node_params?: any): Promise<string>;
 
     /**
-     *  Core run logic should not change from node to node implementation
+     * Core run logic should not change from node to node implementation.
+     * Returns an object containing the action to take next, and the results
+     * from the prep and execution phases for potential snapshotting.
      * @param sharedState Contextual state that is shared across nodes
      */
-  public async run(sharedState: any): Promise<string> {
+  public async run(sharedState: any): Promise<{ action: string, prepResult: any, execResult: any }> {
     log.debug(`run called with sharedState`, { sharedState });
     log.debug(`Current flow_params at start of run`, { flow_params: this.flow_params });
     
@@ -150,9 +153,9 @@ export abstract class BaseNode {
     log.debug(`run finished. Returning action: ${action}`);
     
     // Add verbose logging of the final action
-    log.verbose('run action result', JSON.stringify({ action }));
-    
-    return action;
+    log.verbose('run action result', JSON.stringify({ action, prepResult, execResult }));
+
+    return { action, prepResult, execResult };
   }
 }
 
@@ -276,7 +279,50 @@ export class Flow extends BaseNode {
       nodeParams
     }));
     
-    let currentNode: BaseNode | undefined = await this.getStartNode();
+    // Check if we're resuming from a specific node
+    let currentNode: BaseNode | undefined;
+    
+    if (sharedState.currentNodeId) {
+      log.info(`Resuming from node ${sharedState.currentNodeId}`);
+      
+      // Start from the beginning and find the current node
+      const startNode = await this.getStartNode();
+      
+      // Simple BFS to find the node by ID
+      const queue: BaseNode[] = [startNode];
+      const visited = new Set<string>();
+      
+      while (queue.length > 0 && !currentNode) {
+        const node = queue.shift()!;
+        const nodeId = node.node_params?.id;
+        
+        if (nodeId === sharedState.currentNodeId) {
+          currentNode = node;
+          log.info(`Found current node ${nodeId}`);
+          break;
+        }
+        
+        // Add successors to the queue
+        if (node.successors instanceof Map) {
+          for (const successor of node.successors.values()) {
+            const successorId = successor.node_params?.id;
+            if (successorId && !visited.has(successorId)) {
+              visited.add(successorId);
+              queue.push(successor);
+            }
+          }
+        }
+      }
+      
+      if (!currentNode) {
+        log.warn(`Could not find node with ID ${sharedState.currentNodeId}, starting from beginning`);
+        currentNode = await this.getStartNode();
+      }
+    } else {
+      // Start from the beginning
+      currentNode = await this.getStartNode();
+    }
+    
     while (currentNode) {
       log.debug("Orchestrate -- currentNode", { currentNode });
 
@@ -300,17 +346,41 @@ export class Flow extends BaseNode {
       // Pass both flowParams (as general params) and node-specific params
       currentNode.setParams(paramsToSet, nodeParams ? nodeParams[currentNode.flow_params.id] : undefined);
       log.debug(`Params set for currentNode. Current flow_params`, { flow_params: currentNode.flow_params });
-            const action = await currentNode.run(sharedState);
-            log.debug(`currentNode.run finished. Action: ${action}`);
-            currentNode = currentNode.getSuccessor(action); // If undefined, the flow is complete
-            log.debug(`Next currentNode`, { currentNode });
-        }
-        log.debug(`orchestrate finished`);
-    }
 
-  async run(sharedState: any): Promise<string> {
-    log.debug(`Flow run called with sharedState`, { sharedState });
+      // Get the result object from run()
+      const runResult = await currentNode.run(sharedState);
+      const action = runResult.action; // Extract the action string
+      // prepResult and execResult are available in runResult if needed here, but currently not used by orchestrate directly
+      log.debug(`currentNode.run finished. Action: ${action}`);
+
+      // Check if we should stay on the current node using the extracted action
+      if (action === STAY_ON_NODE_ACTION) {
+        log.info(`Staying on node ${currentNode.node_params?.id}`);
+        
+        // Store the current node ID in shared state
+        sharedState.currentNodeId = currentNode.node_params?.id;
+        
+        // Return early without moving to the next node
+        log.debug(`orchestrate paused at node ${currentNode.node_params?.id}`);
+        return;
+      }
+      
+      // Move to the next node
+      currentNode = currentNode.getSuccessor(action); // If undefined, the flow is complete
+      log.debug(`Next currentNode`, { currentNode });
+    }
     
+    // Flow completed
+    log.debug(`orchestrate finished - flow completed`);
+    
+    // Clear the current node ID since the flow is complete
+    sharedState.currentNodeId = undefined;
+  }
+
+  // Update return type to match BaseNode
+  async run(sharedState: any): Promise<{ action: string, prepResult: any, execResult: any }> {
+    log.debug(`Flow run called with sharedState`, { sharedState });
+
     // Add verbose logging of the input parameters
     log.verbose('Flow run input', JSON.stringify({
       sharedState
@@ -329,10 +399,11 @@ export class Flow extends BaseNode {
     log.debug(`Flow postResult`, { postResult });
     
     // Add verbose logging of the post result
-    log.verbose('Flow run postResult', JSON.stringify({ postResult }));
-    
+    log.verbose('Flow run postResult', JSON.stringify({ postResult, prepResult }));
+
     log.debug(`Flow run finished`);
-    return postResult;
+    // Return the action from post, the prepResult, and undefined for execResult
+    return { action: postResult, prepResult, execResult: undefined };
   }
 
   async post(prepResult: any, execResult: any, sharedState: any, node_params?: any): Promise<string> {
@@ -370,9 +441,10 @@ export class BatchFlow extends Flow {
         return [];
     }
 
-    async run(sharedState: any): Promise<string> {
+    // Update return type to match BaseNode
+    async run(sharedState: any): Promise<{ action: string, prepResult: any, execResult: any }> {
         log.debug("BatchFlow -- run");
-        
+
         // Add verbose logging of the input parameters
         log.verbose('BatchFlow run input', JSON.stringify({
           sharedState
@@ -393,7 +465,9 @@ export class BatchFlow extends Flow {
         // Add verbose logging of the result list
         log.verbose('BatchFlow run resultList', JSON.stringify(resultList));
 
-        return this.post(prepResultList, resultList, sharedState);
+        const action = await this.post(prepResultList, resultList, sharedState);
+        // Return the action from post, the prepResult list, and the result list
+        return { action, prepResult: prepResultList, execResult: resultList };
     }
 
     async post(prepResultList: any[], resultList: any[], sharedState: any, node_params?: any): Promise<string> {

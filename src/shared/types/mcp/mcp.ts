@@ -1,6 +1,8 @@
 import { z } from 'zod';
 import { ToolSchema } from '@modelcontextprotocol/sdk/types.js';
 import { StdioServerParameters } from '@modelcontextprotocol/sdk/client/stdio.js';
+import { SSEClientTransportOptions } from '@modelcontextprotocol/sdk/client/sse.js';
+import { StreamableHTTPClientTransportOptions } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 
 // Constants
 export const SERVER_DIR_PREFIX = 'mcp-servers';
@@ -27,12 +29,33 @@ export type MCPStdioConfig = StdioServerParameters & MCPManagerConfig & {
   transport: 'stdio';
 };
 
+export type MCPSSEConfig = SSEClientTransportOptions & MCPManagerConfig & {
+  transport: 'sse';
+  serverUrl: string
+};
+
+export type MCPStreamableConfig = StreamableHTTPClientTransportOptions & MCPManagerConfig & {
+  transport: 'streamable';
+  serverUrl: string
+};
+
 export type MCPWebSocketConfig = MCPManagerConfig & {
   transport: 'websocket';
   websocketUrl: string;
 };
 
-export type MCPServerConfig = MCPStdioConfig | MCPWebSocketConfig;
+export type MCPDockerConfig = MCPManagerConfig & {
+  transport: 'docker';
+  image: string;         // Docker image name (e.g., 'ghcr.io/github/github-mcp-server')
+  containerName?: string; // Optional custom container name
+  transportMethod: 'stdio' | 'websocket'; // How to communicate with the container
+  websocketPort?: number; // Port for websocket if using websocket transport
+  volumes?: string[];     // Optional volume mounts
+  networkMode?: string;   // Optional network mode
+  extraArgs?: string[];   // Additional docker run arguments
+};
+
+export type MCPServerConfig = MCPStdioConfig | MCPWebSocketConfig | MCPDockerConfig | MCPSSEConfig | MCPStreamableConfig;
 
 export interface MCPServiceResponse<T = unknown> {
   success: boolean;
@@ -65,4 +88,5 @@ export type MCPServerState = MCPServerConfig & {
   }>;
   error?: string;
   stderrOutput?: string;
+  containerName?: string; // Docker container name (auto-generated or custom)
 };
